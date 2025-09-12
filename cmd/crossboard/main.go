@@ -8,6 +8,7 @@ import (
     "crypto/rand"
     "crypto/sha256"
     "encoding/binary"
+    "encoding/hex"
     "errors"
     "flag"
     "fmt"
@@ -74,6 +75,75 @@ func decrypt(aead cipher.AEAD, in []byte) ([]byte, error) {
         return nil, err
     }
     return pt, nil
+}
+
+// message encoding with IDs (versioned textual header inside the AEAD plaintext)
+// Format:
+//   CB1\n
+//   <32-hex-id>\n
+//   <raw text bytes...>
+
+type msgID [16]byte
+
+func encodeMessage(text string) (msgID, []byte, error) {
+    var id msgID
+    if _, err := rand.Read(id[:]); err != nil {
+        return msgID{}, nil, err
+    }
+    hexID := make([]byte, 32)
+    hex.Encode(hexID, id[:])
+    // Build: CB1\n<hex>\n<text>
+    payload := make([]byte, 0, 4+32+1+len(text))
+    payload = append(payload, 'C', 'B', '1', '\n')
+    payload = append(payload, hexID...)
+    payload = append(payload, '\n')
+    payload = append(payload, []byte(text)...)
+    return id, payload, nil
+}
+
+func decodeMessage(pt []byte) (msgID, string, error) {
+    // Expect header "CB1\n"
+    if !(len(pt) >= 4 && pt[0] == 'C' && pt[1] == 'B' && pt[2] == '1' && pt[3] == '\n') {
+        return msgID{}, "", errors.New("missing CB1 header")
+    }
+    rest := pt[4:]
+    // Next line is 32 hex chars then '\n'
+    if !(len(rest) >= 33 && rest[32] == '\n') {
+        return msgID{}, "", errors.New("malformed id line")
+    }
+    var id msgID
+    if _, err := hex.Decode(id[:], rest[:32]); err != nil {
+        return msgID{}, "", fmt.Errorf("invalid id hex: %w", err)
+    }
+    return id, string(rest[33:]), nil
+}
+
+// idCache tracks seen message IDs to avoid re-applying duplicates.
+type idCache struct {
+    mu    sync.Mutex
+    items map[msgID]time.Time
+}
+
+func newIDCache() *idCache { return &idCache{items: make(map[msgID]time.Time)} }
+
+func (c *idCache) add(id msgID) {
+    c.mu.Lock()
+    c.items[id] = time.Now()
+    c.mu.Unlock()
+}
+
+func (c *idCache) contains(id msgID) bool {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    ts, ok := c.items[id]
+    if !ok {
+        return false
+    }
+    if time.Since(ts) > 2*time.Minute {
+        delete(c.items, id)
+        return false
+    }
+    return true
 }
 
 // frame write: [uint32 big endian length][payload]
@@ -228,9 +298,10 @@ type peerConn struct {
 type peerHub struct {
     mu    sync.Mutex
     conns map[*peerConn]struct{}
+    ids   *idCache
 }
 
-func newPeerHub() *peerHub { return &peerHub{conns: make(map[*peerConn]struct{})} }
+func newPeerHub() *peerHub { return &peerHub{conns: make(map[*peerConn]struct{}), ids: newIDCache()} }
 
 func (h *peerHub) add(c net.Conn) *peerConn {
     pc := &peerConn{c: c}
@@ -270,7 +341,12 @@ func (h *peerHub) broadcast(aead cipher.AEAD, text string) {
     }
     h.mu.Unlock()
     for _, pc := range conns {
-        ct, err := encrypt(aead, []byte(text))
+        _, payload, err := encodeMessage(text)
+        if err != nil {
+            log.Printf("encode error: %v", err)
+            continue
+        }
+        ct, err := encrypt(aead, payload)
         if err != nil {
             log.Printf("encrypt error: %v", err)
             continue
@@ -310,7 +386,17 @@ func (h *peerHub) readLoop(ctx context.Context, pc *peerConn, aead cipher.AEAD, 
             log.Printf("decrypt failed from %s: %v", pc.c.RemoteAddr(), err)
             return
         }
-        msg := string(pt)
+        id, msg, derr := decodeMessage(pt)
+        if derr != nil {
+            log.Printf("invalid message from %s: %v", pc.c.RemoteAddr(), derr)
+            continue
+        }
+        // Drop if we've already processed this message ID.
+        if h.ids.contains(id) {
+            log.Printf("duplicate message id from %s; ignoring", pc.c.RemoteAddr())
+            continue
+        }
+        h.ids.add(id)
         // If clipboard already has this content, skip re-setting and sound.
         if cur, err := getClipboard(); err == nil && cur == msg {
             log.Printf("received duplicate clipboard content from %s; ignoring", pc.c.RemoteAddr())
@@ -382,7 +468,12 @@ func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppr
             if err != nil {
                 continue
             }
-            if txt == "" || suppress.contains(txt) {
+            if txt == "" {
+                continue
+            }
+            // If clipboard content was set by us recently, update baseline and skip.
+            if suppress.contains(txt) {
+                lastSentHash = sha256.Sum256([]byte(txt))
                 continue
             }
             h := sha256.Sum256([]byte(txt))
@@ -578,7 +669,14 @@ func sendBytesWithReconnect(ctx context.Context, addr string, aead cipher.AEAD, 
             }
             continue
         }
-        ct, err := encrypt(aead, data)
+        // Wrap data as a message with an ID for dedupe on receiver.
+        _, payload, err := encodeMessage(string(data))
+        if err != nil {
+            log.Printf("encode error: %v", err)
+            conn.Close()
+            return
+        }
+        ct, err := encrypt(aead, payload)
         if err != nil {
             log.Printf("encrypt error: %v", err)
             conn.Close()

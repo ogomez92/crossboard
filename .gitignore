@@ -1,0 +1,36 @@
+# OS junk
+.DS_Store
+
+# Go binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Build output directories
+/bin/
+/build/
+/dist/
+
+# Root binary if built without -o
+/crossboard
+
+# Packaging artifacts
+/packaging/*.zip
+/packaging/*.tar.gz
+/packaging/*.tgz
+
+# Local Go build cache (when GOCACHE points here)
+/.gocache/
+/.GOCACHE/
+
+# Coverage reports
+coverage.out
+cover.out
+
+# Editors/IDEs
+.vscode/
+.idea/
