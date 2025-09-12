@@ -179,7 +179,8 @@ func (s *suppressSet) contains(text string) bool {
 }
 
 // server: listen and handle connections
-func runServer(ctx context.Context, addr string, aead cipher.AEAD, soundPath string, _ interface{}, suppress *suppressSet) error {
+// Now uses a peerHub to support full duplex over any connection (incoming or outgoing).
+func runServer(ctx context.Context, addr string, aead cipher.AEAD, soundPath string, hub *peerHub, suppress *suppressSet) error {
     ln, err := net.Listen("tcp", addr)
     if err != nil {
         return err
@@ -208,127 +209,186 @@ func runServer(ctx context.Context, addr string, aead cipher.AEAD, soundPath str
             }
             return err
         }
+        pc := hub.add(conn)
         wg.Add(1)
-        go func(c net.Conn) {
+        go func(pc *peerConn) {
             defer wg.Done()
-            defer c.Close()
-            r := bufio.NewReader(c)
-            for {
-                frame, err := readFrame(r, 100*1024*1024) // 100MB max
-                if err != nil {
-                    if errors.Is(err, io.EOF) {
-                        return
-                    }
-                    log.Printf("read error from %s: %v", c.RemoteAddr(), err)
-                    return
-                }
-                pt, err := decrypt(aead, frame)
-                if err != nil {
-                    log.Printf("decrypt failed from %s: %v", c.RemoteAddr(), err)
-                    return
-                }
-                msg := string(pt)
-                if err := setClipboard(msg); err != nil {
-                    log.Printf("clipboard set error: %v", err)
-                } else {
-                    suppress.add(msg)
-                    log.Printf("copied %d bytes to clipboard (from %s)", len(msg), c.RemoteAddr())
-                    // Try playing sound if available
-                    if soundPath != "" {
-                        if _, err := os.Stat(soundPath); err == nil {
-                            go func() {
-                                if err := playWAV(soundPath); err != nil {
-                                    log.Printf("sound error: %v", err)
-                                }
-                            }()
-                        }
-                    }
-                }
-            }
-        }(conn)
+            hub.readLoop(ctx, pc, aead, soundPath, suppress)
+        }(pc)
     }
 }
 
-// client: connect and send clipboard updates
-func runClient(ctx context.Context, addr string, aead cipher.AEAD, suppress *suppressSet) {
-    backoff := time.Second
-    const maxBackoff = 10 * time.Second
-    var conn net.Conn
-    var err error
+// peerConn wraps a net.Conn with a write mutex to serialize writes per connection.
+type peerConn struct {
+    c   net.Conn
+    wmu sync.Mutex
+}
+
+// peerHub tracks all active connections (incoming and outgoing)
+type peerHub struct {
+    mu    sync.Mutex
+    conns map[*peerConn]struct{}
+}
+
+func newPeerHub() *peerHub { return &peerHub{conns: make(map[*peerConn]struct{})} }
+
+func (h *peerHub) add(c net.Conn) *peerConn {
+    pc := &peerConn{c: c}
+    h.mu.Lock()
+    h.conns[pc] = struct{}{}
+    h.mu.Unlock()
+    log.Printf("peer connected: %s", c.RemoteAddr())
+    return pc
+}
+
+func (h *peerHub) remove(pc *peerConn) {
+    h.mu.Lock()
+    if _, ok := h.conns[pc]; ok {
+        delete(h.conns, pc)
+    }
+    h.mu.Unlock()
+    _ = pc.c.Close()
+    log.Printf("peer disconnected: %s", pc.c.RemoteAddr())
+}
+
+func (h *peerHub) hasPeers() bool {
+    h.mu.Lock()
+    n := len(h.conns)
+    h.mu.Unlock()
+    return n > 0
+}
+
+// broadcast sends plaintext text to all peers (encrypting independently).
+func (h *peerHub) broadcast(aead cipher.AEAD, text string) {
+    if text == "" {
+        return
+    }
+    h.mu.Lock()
+    conns := make([]*peerConn, 0, len(h.conns))
+    for pc := range h.conns {
+        conns = append(conns, pc)
+    }
+    h.mu.Unlock()
+    for _, pc := range conns {
+        ct, err := encrypt(aead, []byte(text))
+        if err != nil {
+            log.Printf("encrypt error: %v", err)
+            continue
+        }
+        pc.wmu.Lock()
+        err = writeFrame(pc.c, ct)
+        pc.wmu.Unlock()
+        if err != nil {
+            log.Printf("send error to %s: %v", pc.c.RemoteAddr(), err)
+            h.remove(pc)
+        } else {
+            log.Printf("sent %d bytes to %s", len(text), pc.c.RemoteAddr())
+        }
+    }
+}
+
+// readLoop handles inbound messages for a connection until it closes.
+func (h *peerHub) readLoop(ctx context.Context, pc *peerConn, aead cipher.AEAD, soundPath string, suppress *suppressSet) {
+    defer h.remove(pc)
+    r := bufio.NewReader(pc.c)
     for {
         select {
         case <-ctx.Done():
             return
         default:
         }
-        if conn == nil {
-            conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-            if err != nil {
-                log.Printf("connect %s failed: %v", addr, err)
-                time.Sleep(backoff)
-                if backoff < maxBackoff {
-                    backoff *= 2
+        frame, err := readFrame(r, 100*1024*1024)
+        if err != nil {
+            if errors.Is(err, io.EOF) {
+                return
+            }
+            log.Printf("read error from %s: %v", pc.c.RemoteAddr(), err)
+            return
+        }
+        pt, err := decrypt(aead, frame)
+        if err != nil {
+            log.Printf("decrypt failed from %s: %v", pc.c.RemoteAddr(), err)
+            return
+        }
+        msg := string(pt)
+        if err := setClipboard(msg); err != nil {
+            log.Printf("clipboard set error: %v", err)
+        } else {
+            suppress.add(msg)
+            log.Printf("copied %d bytes to clipboard (from %s)", len(msg), pc.c.RemoteAddr())
+            if soundPath != "" {
+                if _, err := os.Stat(soundPath); err == nil {
+                    go func() {
+                        if err := playWAV(soundPath); err != nil {
+                            log.Printf("sound error: %v", err)
+                        }
+                    }()
                 }
+            }
+        }
+    }
+}
+
+// connector dials addr and, on success, adds the connection to the hub and serves a read loop.
+func connector(ctx context.Context, addr string, aead cipher.AEAD, hub *peerHub, soundPath string, suppress *suppressSet) {
+    backoff := time.Second
+    const maxBackoff = 10 * time.Second
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        default:
+        }
+        conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+        if err != nil {
+            log.Printf("connect %s failed: %v", addr, err)
+            time.Sleep(backoff)
+            if backoff < maxBackoff {
+                backoff *= 2
+            }
+            continue
+        }
+        backoff = time.Second
+        pc := hub.add(conn)
+        hub.readLoop(ctx, pc, aead, soundPath, suppress)
+        // when readLoop returns, the connection is closed/removed; retry
+        time.Sleep(backoff)
+        if backoff < maxBackoff {
+            backoff *= 2
+        }
+    }
+}
+
+// clipboardWatcher polls clipboard and broadcasts changes to all peers.
+func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppress *suppressSet) {
+    lastSentHash := [32]byte{}
+    // initial send if content exists (optional)
+    if txt, err := getClipboard(); err == nil {
+        if txt != "" && !suppress.contains(txt) {
+            lastSentHash = sha256.Sum256([]byte(txt))
+            hub.broadcast(aead, txt)
+        }
+    }
+    ticker := time.NewTicker(300 * time.Millisecond)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            txt, err := getClipboard()
+            if err != nil {
                 continue
             }
-            log.Printf("connected to %s", addr)
-            backoff = time.Second
-        }
-
-        // Monitor clipboard and send changes
-        lastSentHash := [32]byte{}
-        send := func(text string) error {
-            if text == "" {
-                return nil
+            if txt == "" || suppress.contains(txt) {
+                continue
             }
-            // Avoid echo loops by not sending what we just set from remote
-            if suppress.contains(text) {
-                return nil
+            h := sha256.Sum256([]byte(txt))
+            if h == lastSentHash {
+                continue
             }
-            hash := sha256.Sum256([]byte(text))
-            if hash == lastSentHash {
-                return nil
-            }
-            ct, err := encrypt(aead, []byte(text))
-            if err != nil {
-                return err
-            }
-            if err := writeFrame(conn, ct); err != nil {
-                return err
-            }
-            lastSentHash = hash
-            log.Printf("sent %d bytes", len(text))
-            return nil
-        }
-
-        // initial send if content exists (optional)
-        if txt, err := getClipboard(); err == nil {
-            _ = send(txt)
-        }
-
-        ticker := time.NewTicker(300 * time.Millisecond)
-        defer ticker.Stop()
-        for {
-            select {
-            case <-ctx.Done():
-                conn.Close()
-                return
-            case <-ticker.C:
-                txt, err := getClipboard()
-                if err != nil {
-                    // clipboard read can fail sporadically; skip
-                    continue
-                }
-                if err := send(txt); err != nil {
-                    log.Printf("send error: %v", err)
-                    conn.Close()
-                    conn = nil
-                    break
-                }
-            }
-            if conn == nil {
-                break
-            }
+            lastSentHash = h
+            hub.broadcast(aead, txt)
         }
     }
 }
@@ -379,45 +439,37 @@ func main() {
         os.Exit(1)
     }
 
-    // Mode selection
-    // Non-monitor mode (no -m): require piped stdin and a destination host, then send and exit.
+    // One-shot mode: if no -m and stdin is piped with a destination arg, send and exit.
     if monitorHost == "" {
-        info, err := os.Stdin.Stat()
-        if err != nil {
-            fmt.Fprintln(os.Stderr, "stdin stat error:", err)
-            os.Exit(1)
-        }
-        if (info.Mode() & os.ModeCharDevice) != 0 {
-            fmt.Fprintln(os.Stderr, "error: no -m provided; expected piped input. Example: echo 'hello' | crossboard -k KEY host[:port]")
-            os.Exit(2)
-        }
-        if len(args) == 0 {
-            fmt.Fprintln(os.Stderr, "error: destination host[:port] required when piping without -m")
-            os.Exit(2)
-        }
-        dest := ensurePort(args[0])
-        data, err := io.ReadAll(os.Stdin)
-        if err != nil {
-            fmt.Fprintln(os.Stderr, "stdin read error:", err)
-            os.Exit(1)
-        }
-        if len(data) == 0 {
-            fmt.Fprintln(os.Stderr, "error: empty input on stdin")
-            os.Exit(2)
-        }
-        done := make(chan struct{})
-        ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-        defer cancel()
-        go func() {
-            sendBytesWithReconnect(ctx, dest, aead, data)
-            close(done)
-        }()
-        select {
-        case <-done:
-            os.Exit(0)
-        case <-ctx.Done():
-            fmt.Fprintln(os.Stderr, "send timed out")
-            os.Exit(1)
+        if info, err := os.Stdin.Stat(); err == nil && (info.Mode()&os.ModeCharDevice) == 0 {
+            if len(args) == 0 {
+                fmt.Fprintln(os.Stderr, "error: destination host[:port] required when piping without -m")
+                os.Exit(2)
+            }
+            dest := ensurePort(args[0])
+            data, err := io.ReadAll(os.Stdin)
+            if err != nil {
+                fmt.Fprintln(os.Stderr, "stdin read error:", err)
+                os.Exit(1)
+            }
+            if len(data) == 0 {
+                fmt.Fprintln(os.Stderr, "error: empty input on stdin")
+                os.Exit(2)
+            }
+            done := make(chan struct{})
+            ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+            defer cancel()
+            go func() {
+                sendBytesWithReconnect(ctx, dest, aead, data)
+                close(done)
+            }()
+            select {
+            case <-done:
+                os.Exit(0)
+            case <-ctx.Done():
+                fmt.Fprintln(os.Stderr, "send timed out")
+                os.Exit(1)
+            }
         }
     }
 
@@ -428,22 +480,25 @@ func main() {
     defer cancel()
 
     suppress := newSuppressSet()
+    hub := newPeerHub()
 
-    // Run server only in monitor mode
+    // Always run server to accept peers
     srvErrCh := make(chan error, 1)
-    if monitorHost != "" {
-        go func() {
-            srvErrCh <- runServer(ctx, listenAddr, aead, soundPath, nil, suppress)
-        }()
-    }
+    go func() {
+        srvErrCh <- runServer(ctx, listenAddr, aead, soundPath, hub, suppress)
+    }()
 
-    // If monitor host provided, run client to send clipboard changes (two-way mode)
+    // Run a connector only if -m is provided (optional)
     if monitorHost != "" {
         dest := ensurePort(monitorHost)
-        go runClient(ctx, dest, aead, suppress)
-        // Also allow typing or piping text to send directly to the peer.
-        go sendFromStdinToPeer(ctx, dest, aead)
+        go connector(ctx, dest, aead, hub, soundPath, suppress)
     }
+
+    // Start clipboard watcher to broadcast local changes to all peers
+    go clipboardWatcher(ctx, aead, hub, suppress)
+
+    // Also allow typing or piping text to send directly to connected peers.
+    go sendFromStdinToPeers(ctx, aead, hub)
 
     // Ensure sound path is absolute in logs for clarity
     if soundPath != "" {
@@ -452,23 +507,18 @@ func main() {
         }
     }
 
-    if monitorHost != "" {
-        select {
-        case <-ctx.Done():
-            log.Println("shutdown")
-        case err := <-srvErrCh:
-            if err != nil {
-                log.Fatalf("server error: %v", err)
-            }
+    select {
+    case <-ctx.Done():
+        log.Println("shutdown")
+    case err := <-srvErrCh:
+        if err != nil {
+            log.Fatalf("server error: %v", err)
         }
-    } else {
-        // Non-monitor mode never reaches here due to early exit above, but keep for safety.
-        log.Println("nothing to do in non-monitor mode")
     }
 }
 
-// sendFromStdinToPeer reads stdin and sends bytes to peer without modification.
-func sendFromStdinToPeer(ctx context.Context, addr string, aead cipher.AEAD) {
+// sendFromStdinToPeers reads stdin and broadcasts bytes to all connected peers.
+func sendFromStdinToPeers(ctx context.Context, aead cipher.AEAD, hub *peerHub) {
     info, _ := os.Stdin.Stat()
     // Only act if input is not a TTY or user is interacting.
     if (info.Mode() & os.ModeCharDevice) == 0 {
@@ -481,7 +531,8 @@ func sendFromStdinToPeer(ctx context.Context, addr string, aead cipher.AEAD) {
         if len(data) == 0 {
             return
         }
-        sendBytesWithReconnect(ctx, addr, aead, data)
+        // Broadcast; if no peers yet, this will be a no-op.
+        hub.broadcast(aead, string(data))
         return
     }
     // Interactive terminal: send each line including newline
@@ -503,7 +554,7 @@ func sendFromStdinToPeer(ctx context.Context, addr string, aead cipher.AEAD) {
         if len(line) == 0 {
             continue
         }
-        sendBytesWithReconnect(ctx, addr, aead, []byte(line))
+        hub.broadcast(aead, line)
     }
 }
 

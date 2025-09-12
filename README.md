@@ -1,17 +1,17 @@
 # Crossboard
 
-Crossboard is a tiny, secure, cross‑platform clipboard sharer. In monitor mode it listens on TCP port `9876` for encrypted text and copies it to your system clipboard, playing a sound each time it copies. The same binary can also monitor your clipboard and send changes to a peer.
+Crossboard is a tiny, secure, cross‑platform clipboard sharer. It always runs a small TCP server (default `:9876`) to accept encrypted clipboard updates and copy them to your system clipboard, playing a sound each time it copies. Optionally, it can also monitor your clipboard and connect to a peer to sync two‑ways — using a single TCP connection.
 
 ## Quick Start
 
-Two‑way sync between two machines (A and B):
+Two‑way sync between two machines (A and B) — only one side needs to specify the other side’s address:
 
 ```
-# On A
+# On A (dial B and sync both directions)
 ./crossboard -k "shared-secret" -m machineB.local
 
-# On B
-./crossboard -k "shared-secret" -m machineA.local
+# On B (just listen)
+./crossboard -k "shared-secret"
 ```
 
 Send text from stdin to a peer (one‑shot, exits after send):
@@ -25,8 +25,8 @@ echo "Hello from A" | ./crossboard -k "shared-secret" machineB.local
 - Encrypted peer‑to‑peer clipboard sharing (AES‑256‑GCM with scrypt key derivation)
 - Cross‑platform: macOS, Windows, Linux
 - Plays `copy.wav` on every successful copy
-- Works as server and client with a single binary
-- Clipboard monitoring mode (`-m`) for automatic syncing
+- Always-on server and optional connector in a single binary
+- Clipboard monitoring mode (`-m`) for automatic syncing (initiates outbound connection)
 
 ## Install
 
@@ -71,27 +71,27 @@ Logs: `journalctl --user -u crossboard -f`.
 
 ## Usage
 
-Crossboard runs in two modes:
+Crossboard runs a server by default and has two usage patterns:
 
-- Monitor mode (`-m host[:port]`): runs a server (default `:9876`) and watches your system clipboard for text; sends changes to the peer and accepts incoming copies.
-- One‑shot mode (no `-m`): requires piped stdin and a destination host; sends once and exits. Does not run a server.
+- Monitor/connect mode (`-m host[:port]`): watches your clipboard and connects to the peer; both sides can send/receive over the single TCP connection. The listener side does not need `-m`.
+- One‑shot mode (no `-m` + piped stdin): send once to a destination host and exit. The server is still started in normal usage, but one‑shot exits after send.
 
 ### Monitor mode: sync to a peer (two‑way)
 
-On each computer, run with the same `-k` and the other machine’s address in `-m`:
+With the same `-k` on both computers, only one side needs to dial the other with `-m`:
 
 ```
-# On Machine A
+# On Machine A (connects to B)
 ./crossboard -k "shared-secret" -m machineB.local
 
-# On Machine B
-./crossboard -k "shared-secret" -m machineA.local
+# On Machine B (listens only)
+./crossboard -k "shared-secret"
 ```
 
 Notes:
 - `-m` accepts `host` or `host:port`. If the port is omitted, `9876` is used.
-- Both sides run a server so either can connect when available.
-- Each side monitors its own system clipboard and sends text changes to the peer.
+- Both sides run a server so either can accept connections. If both also specify `-m` to each other, two connections will work fine; it’s just not required.
+- Each side monitors its own system clipboard and sends text changes to connected peers.
 - If you type or pipe into stdin while it’s running, Crossboard also forwards that input to the peer.
 - Received text is placed on the receiver’s clipboard; a sound is played.
 - Loop protection prevents immediately re‑sending text that was just received and set locally.
@@ -115,7 +115,7 @@ If you pipe without `-m` and omit the destination, or if stdin is a TTY (not pip
 ### Flags
 
 - `-k string`: Required. Shared encryption key (passphrase). Must match on both peers.
-- `-m host[:port]`: Monitor clipboard and send text changes to the given peer (also runs server).
+- `-m host[:port]`: Monitor clipboard and send text changes to the given peer (initiates outbound connection; server always runs).
 - `-addr host:port`: Listen address for incoming connections in monitor mode (default `:9876`).
 - `-sound path`: Path to a WAV file to play on copy (default `copy.wav`).
 
@@ -162,11 +162,11 @@ One‑way sharing from A to B:
 Two‑way sharing (both directions):
 
 ```
-# On A
+# On A (connects to B)
 ./crossboard -k "shared-secret" -m b.local
 
-# On B
-./crossboard -k "shared-secret" -m a.local
+# On B (listens only)
+./crossboard -k "shared-secret"
 ```
 
 ## Error Handling
