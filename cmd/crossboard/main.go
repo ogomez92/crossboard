@@ -311,6 +311,11 @@ func (h *peerHub) readLoop(ctx context.Context, pc *peerConn, aead cipher.AEAD, 
             return
         }
         msg := string(pt)
+        // If clipboard already has this content, skip re-setting and sound.
+        if cur, err := getClipboard(); err == nil && cur == msg {
+            log.Printf("received duplicate clipboard content from %s; ignoring", pc.c.RemoteAddr())
+            continue
+        }
         if err := setClipboard(msg); err != nil {
             log.Printf("clipboard set error: %v", err)
         } else {
@@ -362,12 +367,9 @@ func connector(ctx context.Context, addr string, aead cipher.AEAD, hub *peerHub,
 // clipboardWatcher polls clipboard and broadcasts changes to all peers.
 func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppress *suppressSet) {
     lastSentHash := [32]byte{}
-    // initial send if content exists (optional)
-    if txt, err := getClipboard(); err == nil {
-        if txt != "" && !suppress.contains(txt) {
-            lastSentHash = sha256.Sum256([]byte(txt))
-            hub.broadcast(aead, txt)
-        }
+    // Initialize baseline to current clipboard without sending on startup.
+    if txt, err := getClipboard(); err == nil && txt != "" {
+        lastSentHash = sha256.Sum256([]byte(txt))
     }
     ticker := time.NewTicker(300 * time.Millisecond)
     defer ticker.Stop()
