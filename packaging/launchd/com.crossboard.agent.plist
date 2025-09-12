@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.crossboard.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-lc</string>
+        <string>"/usr/local/bin/crossboard ${CROSSBOARD_ARGS}"</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Example: set in your shell or edit the plist after copying -->
+        <!-- CROSSBOARD_ARGS -->
+        <key>CROSSBOARD_ARGS</key>
+        <string>-k "your-secret" -m peer.host</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>~/</string>
+
+    <key>StandardOutPath</key>
+    <string>~/Library/Logs/crossboard.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/Library/Logs/crossboard.err.log</string>
+</dict>
+</plist>
+

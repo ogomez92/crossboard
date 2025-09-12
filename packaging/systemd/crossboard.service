@@ -1,0 +1,16 @@
+[Unit]
+Description=Crossboard clipboard sharing (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Put args like: CROSSBOARD_ARGS=-k "secret" -m peer.host -sound /path/to/copy.wav
+EnvironmentFile=%h/.config/crossboard.env
+ExecStart=/usr/local/bin/crossboard $CROSSBOARD_ARGS
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+
