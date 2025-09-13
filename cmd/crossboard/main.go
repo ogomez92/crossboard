@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -608,6 +609,13 @@ func (h *peerHub) handleFileFrame(pt []byte, soundPath string, suppress *suppres
 			// Already processed; ignore
 			return nil
 		}
+		// If session already exists, ignore duplicate START (e.g., multiple connections)
+		h.mu.Lock()
+		if _, exists := h.fsessions[id]; exists {
+			h.mu.Unlock()
+			return nil
+		}
+		h.mu.Unlock()
 		// Create per-transfer session dir under "inbox"
 		dir, err := newSessionDir(id)
 		if err != nil {
@@ -685,6 +693,22 @@ func bytesIndexByte(b []byte, c byte) int {
 		}
 	}
 	return -1
+}
+
+// canonicalizePaths returns a stable, absolute, cleaned list for hashing/sending
+func canonicalizePaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		ap := p
+		if abs, err := filepath.Abs(p); err == nil {
+			ap = abs
+		}
+		ap = filepath.Clean(ap)
+		out = append(out, ap)
+	}
+	// sort for stable signature
+	sort.Strings(out)
+	return out
 }
 
 // untarToDir extracts a tar stream into target directory, preserving structure.
@@ -766,6 +790,7 @@ func connector(ctx context.Context, addr string, aead cipher.AEAD, hub *peerHub,
 // clipboardWatcher polls clipboard and broadcasts changes to all peers.
 func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppress *suppressSet, enableFiles bool) {
 	lastSentHash := [32]byte{}
+	var lastPathsSig [32]byte
 	// Initialize baseline to current clipboard without sending on startup.
 	if txt, err := getClipboard(); err == nil && txt != "" {
 		lastSentHash = sha256.Sum256([]byte(txt))
@@ -784,9 +809,17 @@ func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppr
 			// If -f is on and the text looks like absolute paths that exist, send files instead of text.
 			if enableFiles {
 				if paths := parsePathsFromText(txt); len(paths) > 0 {
-					// Suppress re-sending this same clipboard content
+					// Compute canonical signature independent of quoting/order
+					canon := canonicalizePaths(paths)
+					sig := sha256.Sum256([]byte(strings.Join(canon, "\n")))
+					if sig == lastPathsSig {
+						// Already sent this selection recently
+						lastSentHash = sha256.Sum256([]byte(txt))
+						continue
+					}
+					lastPathsSig = sig
 					lastSentHash = sha256.Sum256([]byte(txt))
-					go sendFilesAsStream(ctx, aead, hub, paths)
+					go sendFilesAsStream(ctx, aead, hub, canon)
 					continue
 				}
 			}
