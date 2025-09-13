@@ -27,6 +27,7 @@ echo "Hello from A" | ./crossboard -k "shared-secret" machineB.local
 - Plays `copy.wav` on every successful copy
 - Always-on server and optional connector in a single binary
 - Clipboard monitoring mode (`-m`) for automatic syncing (initiates outbound connection)
+- Optional file transfer in monitor mode with `-f` (macOS/Windows): when you copy files in Finder/Explorer, Crossboard streams them to the peer and places the received files on the peer's clipboard as files.
 
 ## Install
 
@@ -118,8 +119,12 @@ If you pipe without `-m` and omit the destination, or if stdin is a TTY (not pip
 - `-m host[:port]`: Monitor clipboard and send text changes to the given peer (initiates outbound connection; server always runs).
 - `-addr host:port`: Listen address for incoming connections in monitor mode (default `:9876`).
 - `-sound path`: Path to a WAV file to play on copy (default `copy.wav`).
+- `-f`: Enable file transfers (in `-m` monitor mode). When enabled and the OS clipboard contains files, Crossboard streams a tar of the selection. On the receiver, the tar is extracted to a temporary folder and the resulting files/folders are placed on the system clipboard as a file selection.
 
-Note: Crossboard handles text only; images and rich formats are not synchronized.
+Notes:
+- Text is always treated as text; images and rich formats are not synchronized.
+- File transfer via `-f` is supported on macOS and Windows (Finder/Explorer file clipboards). On Linux, `-f` is ignored.
+- To avoid loops, received files are put on the destination file clipboard only (not mirrored back as text).
 
 ## Security
 

@@ -13,6 +13,7 @@ import (
     "flag"
     "fmt"
     "io"
+    "archive/tar"
     "log"
     "net"
     "os"
@@ -214,6 +215,110 @@ func getClipboard() (string, error) {
     return clipboard.ReadAll()
 }
 
+// getClipboardFiles tries to read a list of file paths from the OS clipboard.
+// Returns empty slice if clipboard does not contain files or not supported.
+func getClipboardFiles() ([]string, error) {
+    switch runtime.GOOS {
+    case "darwin":
+        // AppleScript: attempt to read clipboard as alias list (files)
+        script := []string{
+            "-e", "try",
+            "-e", "set theFiles to the clipboard as alias list",
+            "-e", "on error",
+            "-e", "return \"\"",
+            "-e", "end try",
+            "-e", "set out to \"\"",
+            "-e", "repeat with f in theFiles",
+            "-e", "set out to out & POSIX path of f & \n",
+            "-e", "end repeat",
+            "-e", "out",
+        }
+        cmd := exec.Command("osascript", script...)
+        out, err := cmd.Output()
+        if err != nil {
+            return nil, nil
+        }
+        s := strings.TrimSpace(string(out))
+        if s == "" {
+            return nil, nil
+        }
+        lines := strings.Split(s, "\n")
+        var paths []string
+        for _, p := range lines {
+            p = strings.TrimSpace(p)
+            if p == "" {
+                continue
+            }
+            if _, err := os.Stat(p); err == nil {
+                paths = append(paths, p)
+            }
+        }
+        return paths, nil
+    case "windows":
+        ps := `$f = Get-Clipboard -Format FileDropList; if ($null -ne $f) { $f -join "` + "`n" + `" }`
+        cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+        out, err := cmd.Output()
+        if err != nil {
+            return nil, nil
+        }
+        s := strings.TrimSpace(string(out))
+        if s == "" {
+            return nil, nil
+        }
+        lines := strings.Split(s, "\n")
+        var paths []string
+        for _, p := range lines {
+            p = strings.TrimSpace(p)
+            if p == "" {
+                continue
+            }
+            if _, err := os.Stat(p); err == nil {
+                paths = append(paths, p)
+            }
+        }
+        return paths, nil
+    default:
+        return nil, nil
+    }
+}
+
+// setClipboardFiles sets the OS clipboard to a list of file paths (macOS/Windows).
+func setClipboardFiles(paths []string) error {
+    if len(paths) == 0 {
+        return nil
+    }
+    switch runtime.GOOS {
+    case "darwin":
+        // Build AppleScript to set clipboard to a list of file aliases
+        parts := make([]string, 0, len(paths))
+        for _, p := range paths {
+            // Escape quotes
+            ep := strings.ReplaceAll(p, "\"", "\\\"")
+            parts = append(parts, `POSIX file "`+ep+`" as alias`)
+        }
+        obj := "{" + strings.Join(parts, ", ") + "}"
+        cmd := exec.Command("osascript", "-e", "set the clipboard to "+obj)
+        return cmd.Run()
+    case "windows":
+        // Use PowerShell Set-Clipboard -Path
+        // Escape backticks and quotes for PowerShell string array
+        esc := func(s string) string {
+            s = strings.ReplaceAll(s, "`", "``")
+            s = strings.ReplaceAll(s, "\"", "`\"")
+            return s
+        }
+        items := make([]string, 0, len(paths))
+        for _, p := range paths {
+            items = append(items, `"`+esc(p)+`"`)
+        }
+        ps := `Set-Clipboard -Path @(` + strings.Join(items, `,`) + `)`
+        cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+        return cmd.Run()
+    default:
+        return errors.New("file clipboard not supported on this OS")
+    }
+}
+
 // suppressSet tracks content set by us to avoid echoing back
 type suppressSet struct {
     mu    sync.Mutex
@@ -299,9 +404,11 @@ type peerHub struct {
     mu    sync.Mutex
     conns map[*peerConn]struct{}
     ids   *idCache
+    fileIDs *idCache
+    fsessions map[msgID]*fileSession
 }
 
-func newPeerHub() *peerHub { return &peerHub{conns: make(map[*peerConn]struct{}), ids: newIDCache()} }
+func newPeerHub() *peerHub { return &peerHub{conns: make(map[*peerConn]struct{}), ids: newIDCache(), fileIDs: newIDCache(), fsessions: make(map[msgID]*fileSession)} }
 
 func (h *peerHub) add(c net.Conn) *peerConn {
     pc := &peerConn{c: c}
@@ -363,6 +470,30 @@ func (h *peerHub) broadcast(aead cipher.AEAD, text string) {
     }
 }
 
+// broadcastPlain encrypts and sends the given plaintext payload to all peers.
+func (h *peerHub) broadcastPlain(aead cipher.AEAD, payload []byte) {
+    h.mu.Lock()
+    conns := make([]*peerConn, 0, len(h.conns))
+    for pc := range h.conns {
+        conns = append(conns, pc)
+    }
+    h.mu.Unlock()
+    for _, pc := range conns {
+        ct, err := encrypt(aead, payload)
+        if err != nil {
+            log.Printf("encrypt error: %v", err)
+            continue
+        }
+        pc.wmu.Lock()
+        err = writeFrame(pc.c, ct)
+        pc.wmu.Unlock()
+        if err != nil {
+            log.Printf("send error to %s: %v", pc.c.RemoteAddr(), err)
+            h.remove(pc)
+        }
+    }
+}
+
 // readLoop handles inbound messages for a connection until it closes.
 func (h *peerHub) readLoop(ctx context.Context, pc *peerConn, aead cipher.AEAD, soundPath string, suppress *suppressSet) {
     defer h.remove(pc)
@@ -386,28 +517,136 @@ func (h *peerHub) readLoop(ctx context.Context, pc *peerConn, aead cipher.AEAD, 
             log.Printf("decrypt failed from %s: %v", pc.c.RemoteAddr(), err)
             return
         }
-        id, msg, derr := decodeMessage(pt)
-        if derr != nil {
-            log.Printf("invalid message from %s: %v", pc.c.RemoteAddr(), derr)
+        // Dispatch on header: text or file payload
+        if len(pt) >= 4 && pt[0] == 'C' && pt[1] == 'B' && pt[2] == '1' && pt[3] == '\n' {
+            id, msg, derr := decodeMessage(pt)
+            if derr != nil {
+                log.Printf("invalid message from %s: %v", pc.c.RemoteAddr(), derr)
+                continue
+            }
+            if h.ids.contains(id) {
+                continue
+            }
+            h.ids.add(id)
+            if cur, err := getClipboard(); err == nil && cur == msg {
+                continue
+            }
+            if err := setClipboard(msg); err != nil {
+                log.Printf("clipboard set error: %v", err)
+            } else {
+                suppress.add(msg)
+                log.Printf("copied %d bytes to clipboard (from %s)", len(msg), pc.c.RemoteAddr())
+                if soundPath != "" {
+                    if _, err := os.Stat(soundPath); err == nil {
+                        go func() {
+                            if err := playWAV(soundPath); err != nil {
+                                log.Printf("sound error: %v", err)
+                            }
+                        }()
+                    }
+                }
+            }
             continue
         }
-        // Drop if we've already processed this message ID.
-        if h.ids.contains(id) {
-            log.Printf("duplicate message id from %s; ignoring", pc.c.RemoteAddr())
+        if len(pt) >= 5 && pt[0] == 'C' && pt[1] == 'B' && pt[2] == 'F' && pt[3] == '1' && pt[4] == '\n' {
+            // File transfer frame
+            if err := h.handleFileFrame(pt, soundPath); err != nil {
+                log.Printf("file frame error from %s: %v", pc.c.RemoteAddr(), err)
+            }
             continue
         }
-        h.ids.add(id)
-        // If clipboard already has this content, skip re-setting and sound.
-        if cur, err := getClipboard(); err == nil && cur == msg {
-            log.Printf("received duplicate clipboard content from %s; ignoring", pc.c.RemoteAddr())
-            continue
+        // Unknown payload; ignore
+    }
+}
+
+// fileSession holds state for an in-progress tar extraction
+type fileSession struct {
+    wr    *io.PipeWriter
+    done  chan struct{}
+    dir   string
+}
+
+func (h *peerHub) handleFileFrame(pt []byte, soundPath string) error {
+    // Expect: CBF1\n<32hex>\nTYPE\n[bytes]
+    rest := pt[5:]
+    if !(len(rest) >= 33 && rest[32] == '\n') {
+        return errors.New("malformed file id line")
+    }
+    var id msgID
+    if _, err := hex.Decode(id[:], rest[:32]); err != nil {
+        return fmt.Errorf("invalid file id hex: %w", err)
+    }
+    rest = rest[33:]
+    // Read type line
+    idx := bytesIndexByte(rest, '\n')
+    if idx < 0 {
+        return errors.New("missing type line")
+    }
+    typ := string(rest[:idx])
+    payload := rest[idx+1:]
+
+    switch typ {
+    case "START":
+        if h.fileIDs.contains(id) {
+            // Already processed; ignore
+            return nil
         }
-        if err := setClipboard(msg); err != nil {
-            log.Printf("clipboard set error: %v", err)
-        } else {
-            suppress.add(msg)
-            log.Printf("copied %d bytes to clipboard (from %s)", len(msg), pc.c.RemoteAddr())
-            if soundPath != "" {
+        // Create session and start extractor
+        dir, err := os.MkdirTemp("", "crossboard-*")
+        if err != nil {
+            return err
+        }
+        pr, pw := io.Pipe()
+        done := make(chan struct{})
+        sess := &fileSession{wr: pw, done: done, dir: dir}
+        h.mu.Lock()
+        h.fsessions[id] = sess
+        h.mu.Unlock()
+        go func() {
+            defer close(done)
+            err := untarToDir(pr, dir)
+            if err != nil {
+                log.Printf("untar error: %v", err)
+            }
+        }()
+        return nil
+    case "DATA":
+        h.mu.Lock()
+        sess := h.fsessions[id]
+        h.mu.Unlock()
+        if sess == nil {
+            return errors.New("unknown file session")
+        }
+        // Write payload to pipe
+        if len(payload) > 0 {
+            if _, err := sess.wr.Write(payload); err != nil {
+                return err
+            }
+        }
+        return nil
+    case "END":
+        h.mu.Lock()
+        sess := h.fsessions[id]
+        delete(h.fsessions, id)
+        h.mu.Unlock()
+        if sess == nil {
+            return errors.New("unknown file session end")
+        }
+        // Close writer to finish extraction
+        _ = sess.wr.Close()
+        <-sess.done
+        h.fileIDs.add(id)
+        // Collect top-level entries in dir to put on clipboard
+        entries, _ := os.ReadDir(sess.dir)
+        var paths []string
+        for _, e := range entries {
+            paths = append(paths, filepath.Join(sess.dir, e.Name()))
+        }
+        if len(paths) > 0 {
+            // Set file clipboard; do NOT set text clipboard to avoid ping-pong
+            if err := setClipboardFiles(paths); err != nil {
+                log.Printf("set file clipboard failed: %v", err)
+            } else if soundPath != "" {
                 if _, err := os.Stat(soundPath); err == nil {
                     go func() {
                         if err := playWAV(soundPath); err != nil {
@@ -416,6 +655,65 @@ func (h *peerHub) readLoop(ctx context.Context, pc *peerConn, aead cipher.AEAD, 
                     }()
                 }
             }
+        }
+        return nil
+    default:
+        return fmt.Errorf("unknown file frame type: %s", typ)
+    }
+}
+
+// bytesIndexByte is like bytes.IndexByte without importing bytes to avoid overhead
+func bytesIndexByte(b []byte, c byte) int {
+    for i, v := range b {
+        if v == c {
+            return i
+        }
+    }
+    return -1
+}
+
+// untarToDir extracts a tar stream into target directory, preserving structure.
+func untarToDir(r io.Reader, dir string) error {
+    tr := tar.NewReader(r)
+    for {
+        hdr, err := tr.Next()
+        if err != nil {
+            if errors.Is(err, io.EOF) {
+                return nil
+            }
+            return err
+        }
+        name := filepath.Clean(hdr.Name)
+        if strings.HasPrefix(name, "..") {
+            continue // skip unsafe
+        }
+        target := filepath.Join(dir, name)
+        switch hdr.Typeflag {
+        case tar.TypeDir:
+            if err := os.MkdirAll(target, 0o755); err != nil {
+                return err
+            }
+        case tar.TypeReg, tar.TypeRegA:
+            if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+                return err
+            }
+            f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+            if err != nil {
+                return err
+            }
+            if _, err := io.Copy(f, tr); err != nil {
+                f.Close()
+                return err
+            }
+            f.Close()
+        case tar.TypeSymlink:
+            if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+                return err
+            }
+            // Best-effort create symlink
+            _ = os.Symlink(hdr.Linkname, target)
+        default:
+            // ignore other types
         }
     }
 }
@@ -451,11 +749,18 @@ func connector(ctx context.Context, addr string, aead cipher.AEAD, hub *peerHub,
 }
 
 // clipboardWatcher polls clipboard and broadcasts changes to all peers.
-func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppress *suppressSet) {
+func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppress *suppressSet, enableFiles bool) {
     lastSentHash := [32]byte{}
+    var lastFilesSig [32]byte
     // Initialize baseline to current clipboard without sending on startup.
     if txt, err := getClipboard(); err == nil && txt != "" {
         lastSentHash = sha256.Sum256([]byte(txt))
+    }
+    if enableFiles {
+        if paths, _ := getClipboardFiles(); len(paths) > 0 {
+            sig := sha256.Sum256([]byte(strings.Join(paths, "\n")))
+            lastFilesSig = sig
+        }
     }
     ticker := time.NewTicker(300 * time.Millisecond)
     defer ticker.Stop()
@@ -464,14 +769,23 @@ func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppr
         case <-ctx.Done():
             return
         case <-ticker.C:
+            // If file mode enabled, prefer files when clipboard contains file list
+            if enableFiles {
+                if paths, _ := getClipboardFiles(); len(paths) > 0 {
+                    sig := sha256.Sum256([]byte(strings.Join(paths, "\n")))
+                    if sig != lastFilesSig {
+                        lastFilesSig = sig
+                        go sendFilesAsStream(ctx, aead, hub, paths)
+                    }
+                    // When files detected, skip text processing this tick
+                    continue
+                }
+            }
+            // Fallback to text
             txt, err := getClipboard()
-            if err != nil {
+            if err != nil || txt == "" {
                 continue
             }
-            if txt == "" {
-                continue
-            }
-            // If clipboard content was set by us recently, update baseline and skip.
             if suppress.contains(txt) {
                 lastSentHash = sha256.Sum256([]byte(txt))
                 continue
@@ -502,12 +816,14 @@ func main() {
         keyString   string
         listenAddr  string
         soundPath   string
+        fileMode   bool
     )
 
     flag.StringVar(&monitorHost, "m", "", "monitor clipboard and send to host (hostname or host:port)")
     flag.StringVar(&keyString, "k", "", "shared encryption key (required)")
     flag.StringVar(&listenAddr, "addr", defaultListenAddr, "listen address for incoming connections")
     flag.StringVar(&soundPath, "sound", "copy.wav", "path to WAV sound file to play on copy")
+    flag.BoolVar(&fileMode, "f", false, "enable file transfer in monitor mode (-m)")
     flag.Parse()
     args := flag.Args()
 
@@ -588,7 +904,7 @@ func main() {
     }
 
     // Start clipboard watcher to broadcast local changes to all peers
-    go clipboardWatcher(ctx, aead, hub, suppress)
+    go clipboardWatcher(ctx, aead, hub, suppress, fileMode)
 
     // Also allow typing or piping text to send directly to connected peers.
     go sendFromStdinToPeers(ctx, aead, hub)
@@ -695,4 +1011,196 @@ func sendBytesWithReconnect(ctx context.Context, addr string, aead cipher.AEAD, 
         log.Printf("sent %d bytes from stdin", len(data))
         return
     }
+}
+
+// -------- File sending (client) --------
+
+// encode file control frames
+func encodeFileStart() (msgID, []byte, error) {
+    var id msgID
+    if _, err := rand.Read(id[:]); err != nil {
+        return msgID{}, nil, err
+    }
+    hexID := make([]byte, 32)
+    hex.Encode(hexID, id[:])
+    payload := make([]byte, 0, 5+32+1+6)
+    payload = append(payload, 'C', 'B', 'F', '1', '\n')
+    payload = append(payload, hexID...)
+    payload = append(payload, '\n')
+    payload = append(payload, []byte("START\n")...)
+    return id, payload, nil
+}
+
+func encodeFileData(id msgID, chunk []byte) []byte {
+    hexID := make([]byte, 32)
+    hex.Encode(hexID, id[:])
+    payload := make([]byte, 0, 5+32+1+5+len(chunk))
+    payload = append(payload, 'C', 'B', 'F', '1', '\n')
+    payload = append(payload, hexID...)
+    payload = append(payload, '\n')
+    payload = append(payload, []byte("DATA\n")...)
+    payload = append(payload, chunk...)
+    return payload
+}
+
+func encodeFileEnd(id msgID) []byte {
+    hexID := make([]byte, 32)
+    hex.Encode(hexID, id[:])
+    payload := make([]byte, 0, 5+32+1+4)
+    payload = append(payload, 'C', 'B', 'F', '1', '\n')
+    payload = append(payload, hexID...)
+    payload = append(payload, '\n')
+    payload = append(payload, []byte("END\n")...)
+    return payload
+}
+
+// sendFilesAsStream tars the given paths and streams chunks to peers.
+func sendFilesAsStream(ctx context.Context, aead cipher.AEAD, hub *peerHub, paths []string) {
+    if len(paths) == 0 {
+        return
+    }
+    // Prepare pipe: tar writer -> reader -> chunk sender
+    pr, pw := io.Pipe()
+    // Start tar writing in background
+    go func() {
+        err := writeTar(paths, pw)
+        _ = pw.CloseWithError(err)
+    }()
+    // Announce start
+    id, startPayload, err := encodeFileStart()
+    if err != nil {
+        log.Printf("file start encode error: %v", err)
+        return
+    }
+    hub.broadcastPlain(aead, startPayload)
+    // Stream chunks
+    buf := make([]byte, 1<<20) // 1MB chunks
+    for {
+        n, err := pr.Read(buf)
+        if n > 0 {
+            payload := encodeFileData(id, buf[:n])
+            hub.broadcastPlain(aead, payload)
+        }
+        if err != nil {
+            if !errors.Is(err, io.EOF) {
+                log.Printf("tar read error: %v", err)
+            }
+            break
+        }
+        select {
+        case <-ctx.Done():
+            return
+        default:
+        }
+    }
+    // Send end
+    endPayload := encodeFileEnd(id)
+    hub.broadcastPlain(aead, endPayload)
+}
+
+// writeTar writes the provided files/dirs into a tar stream.
+func writeTar(paths []string, w io.Writer) error {
+    tw := tar.NewWriter(w)
+    defer tw.Close()
+    for _, p := range paths {
+        abs, err := filepath.Abs(p)
+        if err != nil {
+            abs = p
+        }
+        fi, err := os.Lstat(abs)
+        if err != nil {
+            return err
+        }
+        base := filepath.Base(abs)
+        if fi.IsDir() {
+            // Walk directory
+            err = filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
+                if err != nil {
+                    return err
+                }
+                rel, _ := filepath.Rel(abs, path)
+                name := filepath.ToSlash(filepath.Join(base, rel))
+                info, err := d.Info()
+                if err != nil {
+                    return err
+                }
+                if d.IsDir() {
+                    hdr, err := tar.FileInfoHeader(info, "")
+                    if err != nil {
+                        return err
+                    }
+                    hdr.Name = name
+                    if err := tw.WriteHeader(hdr); err != nil {
+                        return err
+                    }
+                    return nil
+                }
+                if info.Mode()&os.ModeSymlink != 0 {
+                    link, err := os.Readlink(path)
+                    if err != nil {
+                        return err
+                    }
+                    hdr, err := tar.FileInfoHeader(info, link)
+                    if err != nil {
+                        return err
+                    }
+                    hdr.Name = name
+                    return tw.WriteHeader(hdr)
+                }
+                hdr, err := tar.FileInfoHeader(info, "")
+                if err != nil {
+                    return err
+                }
+                hdr.Name = name
+                if err := tw.WriteHeader(hdr); err != nil {
+                    return err
+                }
+                f, err := os.Open(path)
+                if err != nil {
+                    return err
+                }
+                _, err = io.Copy(tw, f)
+                f.Close()
+                return err
+            })
+            if err != nil {
+                return err
+            }
+        } else {
+            // Single file or symlink
+            if fi.Mode()&os.ModeSymlink != 0 {
+                link, err := os.Readlink(abs)
+                if err != nil {
+                    return err
+                }
+                hdr, err := tar.FileInfoHeader(fi, link)
+                if err != nil {
+                    return err
+                }
+                hdr.Name = filepath.ToSlash(base)
+                if err := tw.WriteHeader(hdr); err != nil {
+                    return err
+                }
+            } else {
+                hdr, err := tar.FileInfoHeader(fi, "")
+                if err != nil {
+                    return err
+                }
+                hdr.Name = filepath.ToSlash(base)
+                if err := tw.WriteHeader(hdr); err != nil {
+                    return err
+                }
+                f, err := os.Open(abs)
+                if err != nil {
+                    return err
+                }
+                _, err = io.Copy(tw, f)
+                f.Close()
+                if err != nil {
+                    return err
+                }
+            }
+        }
+    }
+    return nil
 }
