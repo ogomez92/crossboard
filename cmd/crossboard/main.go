@@ -828,6 +828,11 @@ func (h *peerHub) handleFileFrame(pt []byte, soundPath string, suppress *suppres
 			}
 		}
 		log.Printf("received files extracted to inbox: %s (%d items)", sess.dir, len(paths))
+		if h.opener != "" {
+			log.Printf("opening inbox with custom explorer: %s", h.opener)
+		} else {
+			log.Printf("opening inbox with system explorer")
+		}
 		// Open the folder for convenience
 		go openFolder(h.opener, sess.dir)
 		return nil
@@ -1036,6 +1041,24 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gcm error:", err)
 		os.Exit(1)
+	}
+
+	// Resolve and validate custom opener if provided; exit if not found
+	if openerPath != "" {
+		resolved := openerPath
+		if _, err := os.Stat(resolved); err != nil {
+			if lp, err2 := exec.LookPath(resolved); err2 == nil {
+				resolved = lp
+			} else {
+				fmt.Fprintln(os.Stderr, "error: -x custom explorer not found:", openerPath)
+				os.Exit(2)
+			}
+		}
+		if p, err := filepath.Abs(resolved); err == nil {
+			resolved = p
+		}
+		openerPath = resolved
+		log.Printf("custom explorer (-x) recognized: %s", openerPath)
 	}
 
 	// One-shot mode: if no -m and stdin is piped with a destination arg, send and exit.
