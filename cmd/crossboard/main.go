@@ -218,6 +218,10 @@ func getClipboard() (string, error) { return clipboard.ReadAll() }
 // parsePathsFromText returns existing file paths when the clipboard text looks like
 // a list of paths from "Copy as Path" (Windows) or Finder's "Copy ... as Pathname" (macOS).
 func parsePathsFromText(txt string) []string {
+	// Handle macOS multiple selection where Finder copies space-separated quoted paths.
+	if toks := extractQuotedTokens(txt); len(toks) > 0 {
+		return filterExistingPaths(toks)
+	}
 	// Split by newlines, trim spaces, strip surrounding quotes
 	raw := strings.Split(strings.ReplaceAll(txt, "\r\n", "\n"), "\n")
 	paths := make([]string, 0, len(raw))
@@ -270,6 +274,111 @@ func parsePathsFromText(txt string) []string {
 		}
 		if !looksAbsolute {
 			// Skip non-absolute paths to reduce false positives
+			continue
+		}
+		if _, err := os.Stat(s); err == nil {
+			paths = append(paths, s)
+		}
+	}
+	return paths
+}
+
+// extractQuotedTokens pulls out '...'/"..." tokens when there are 2 or more.
+func extractQuotedTokens(s string) []string {
+	t := strings.TrimSpace(s)
+	if !strings.ContainsAny(t, "'\"") {
+		return nil
+	}
+	var out []string
+	in := []rune(t)
+	n := len(in)
+	i := 0
+	for i < n {
+		r := in[i]
+		if r == '\'' || r == '"' {
+			quote := r
+			i++
+			start := i
+			for i < n {
+				if in[i] == quote {
+					out = append(out, string(in[start:i]))
+					i++
+					break
+				}
+				if in[i] == '\\' && i+1 < n && in[i+1] == quote {
+					i += 2
+					continue
+				}
+				i++
+			}
+			continue
+		}
+		i++
+	}
+	if len(out) >= 2 {
+		for idx := range out {
+			out[idx] = strings.ReplaceAll(out[idx], "\\'", "'")
+			out[idx] = strings.ReplaceAll(out[idx], `\"`, `"`)
+		}
+		return out
+	}
+	return nil
+}
+
+// filterExistingPaths normalizes tokens and returns only those that exist.
+func filterExistingPaths(tokens []string) []string {
+	paths := make([]string, 0, len(tokens))
+	for _, s := range tokens {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if (strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"")) || (strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'")) {
+			s = s[1 : len(s)-1]
+		}
+		if runtime.GOOS != "windows" && strings.HasPrefix(s, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				s = filepath.Join(home, s[2:])
+			}
+		}
+		if strings.HasPrefix(s, "file://") {
+			if u, err := neturl.Parse(s); err == nil {
+				if runtime.GOOS == "windows" {
+					if u.Host != "" {
+						s = `\\` + u.Host + filepath.FromSlash(u.Path)
+					} else {
+						p := u.Path
+						if len(p) >= 4 && p[0] == '/' && p[2] == ':' {
+							p = p[1:]
+						}
+						if un, err := neturl.PathUnescape(p); err == nil {
+							p = un
+						}
+						s = filepath.FromSlash(p)
+					}
+				} else {
+					p := u.Path
+					if un, err := neturl.PathUnescape(p); err == nil {
+						p = un
+					}
+					s = filepath.FromSlash(p)
+				}
+			}
+		}
+		looksAbsolute := false
+		if runtime.GOOS == "windows" {
+			if len(s) >= 3 && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
+				looksAbsolute = true
+			}
+			if strings.HasPrefix(s, `\\\\`) {
+				looksAbsolute = true
+			}
+		} else {
+			if strings.HasPrefix(s, "/") {
+				looksAbsolute = true
+			}
+		}
+		if !looksAbsolute {
 			continue
 		}
 		if _, err := os.Stat(s); err == nil {
