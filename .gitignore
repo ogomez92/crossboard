@@ -34,3 +34,4 @@ cover.out
 # Editors/IDEs
 .vscode/
 .idea/
+**/.DS_Store

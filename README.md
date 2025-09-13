@@ -67,4 +67,5 @@ See `packaging/` for launchd (macOS) and systemd (Linux) examples.
 
 ## License
 
-MIT (or your preferred license).
+Unlicense
+
