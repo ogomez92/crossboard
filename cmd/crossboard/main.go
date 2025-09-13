@@ -686,9 +686,35 @@ func newSessionDir(id msgID) (string, error) {
 
 func openFolder(opener, path string) {
 	// Custom opener if provided
+	if runtime.GOOS == "windows" {
+		// Use PowerShell to start and try to focus with WScript.Shell AppActivate
+		psQuote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+		exe := "explorer"
+		if opener != "" {
+			exe = opener
+		}
+		ps := strings.Join([]string{
+			"$exe = " + psQuote(exe),
+			"$arg = " + psQuote(path),
+			"$p = Start-Process -FilePath $exe -ArgumentList @($arg) -PassThru -WindowStyle Normal",
+			"Start-Sleep -Milliseconds 250",
+			"try { $ws = New-Object -ComObject WScript.Shell; [void]$ws.AppActivate($p.Id) } catch { }",
+		}, "; ")
+		cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+		if err := cmd.Start(); err == nil {
+			return
+		}
+		// Fallback to plain exec if PowerShell is not available
+		if opener != "" {
+			if err := exec.Command(opener, path).Start(); err == nil {
+				return
+			}
+		}
+		_ = exec.Command("explorer", path).Start()
+		return
+	}
 	if opener != "" {
-		cmd := exec.Command(opener, path)
-		if e := cmd.Start(); e == nil {
+		if e := exec.Command(opener, path).Start(); e == nil {
 			return
 		} else {
 			log.Printf("custom opener failed, falling back: %v", e)
@@ -698,8 +724,6 @@ func openFolder(opener, path string) {
 	switch runtime.GOOS {
 	case "darwin":
 		cmd = exec.Command("open", path)
-	case "windows":
-		cmd = exec.Command("explorer", path)
 	default:
 		// Best-effort for Linux/others
 		if _, err := exec.LookPath("xdg-open"); err == nil {
