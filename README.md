@@ -27,7 +27,7 @@ echo "Hello from A" | ./crossboard -k "shared-secret" machineB.local
 - Plays `copy.wav` on every successful copy
 - Always-on server and optional connector in a single binary
 - Clipboard monitoring mode (`-m`) for automatic syncing (initiates outbound connection)
-- Optional file transfer in monitor mode with `-f` (macOS/Windows): when you copy files in Finder/Explorer, Crossboard streams them to the peer and places the received files on the peer's clipboard as files.
+- Optional file transfer in monitor mode with `-f`: when you copy a file path as text (e.g., Copy as Path/Pathname) the sender detects path-like text and streams the referenced files/folders to the peer. Supports POSIX paths and `file://` URIs.
 
 ## Install
 
@@ -119,13 +119,12 @@ If you pipe without `-m` and omit the destination, or if stdin is a TTY (not pip
 - `-m host[:port]`: Monitor clipboard and send text changes to the given peer (initiates outbound connection; server always runs).
 - `-addr host:port`: Listen address for incoming connections in monitor mode (default `:9876`).
 - `-sound path`: Path to a WAV file to play on copy (default `copy.wav`).
-- `-f`: Enable file transfers (in `-m` monitor mode). When enabled and the OS clipboard contains files, Crossboard streams a tar of the selection. On the receiver, the tar is extracted to a temporary folder and the resulting files/folders are placed on the system clipboard as a file selection.
+- `-f`: Enable file transfers (in `-m` monitor mode). When enabled and the clipboard text looks like absolute file paths (Windows “Copy as path”, macOS Finder “Copy … as Pathname”, Linux file manager address bar or “Copy Location”), Crossboard tars those paths and streams them to the peer. `file://` URIs are also recognized.
 
 Notes:
-- Text is always treated as text; images and rich formats are not synchronized.
-- File transfer via `-f` is supported on macOS and Windows (Finder/Explorer file clipboards). On Linux, `-f` is ignored.
-- To avoid loops, received files are put on the destination file clipboard only (not mirrored back as text).
-  - Paste files into Finder (macOS) or Explorer (Windows) — not into text fields. The clipboard holds file references for paste actions in file managers.
+- Text is always treated as text unless it looks like absolute paths and `-f` is enabled.
+- The receiver extracts into an `inbox` folder next to the app binary, under a timestamped subfolder (e.g., `inbox/20250101-123456-abcd1234`). It auto-opens that folder in Finder/Explorer and plays the copy sound. The system clipboard is not modified.
+- This approach avoids platform-specific file clipboard APIs and avoids ping‑pong.
 
 ## Security
 

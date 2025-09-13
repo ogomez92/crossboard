@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -211,128 +212,70 @@ func setClipboard(text string) error {
 	return clipboard.WriteAll(text)
 }
 
-func getClipboard() (string, error) {
-	return clipboard.ReadAll()
-}
+func getClipboard() (string, error) { return clipboard.ReadAll() }
 
-// getClipboardFiles tries to read a list of file paths from the OS clipboard.
-// Returns empty slice if clipboard does not contain files or not supported.
-func getClipboardFiles() ([]string, error) {
-	switch runtime.GOOS {
-	case "darwin":
-		// AppleScript: attempt to read clipboard as alias list (files)
-		script := []string{
-			"-e", "try",
-			"-e", "set theFiles to the clipboard as alias list",
-			"-e", "on error",
-			"-e", "return \"\"",
-			"-e", "end try",
-			"-e", "set out to \"\"",
-			"-e", "repeat with f in theFiles",
-			"-e", "set out to out & POSIX path of f & \n",
-			"-e", "end repeat",
-			"-e", "out",
-		}
-		cmd := exec.Command("osascript", script...)
-		out, err := cmd.Output()
-		if err != nil {
-			return nil, nil
-		}
-		s := strings.TrimSpace(string(out))
+// parsePathsFromText returns existing file paths when the clipboard text looks like
+// a list of paths from "Copy as Path" (Windows) or Finder's "Copy ... as Pathname" (macOS).
+func parsePathsFromText(txt string) []string {
+	// Split by newlines, trim spaces, strip surrounding quotes
+	raw := strings.Split(strings.ReplaceAll(txt, "\r\n", "\n"), "\n")
+	paths := make([]string, 0, len(raw))
+	for _, line := range raw {
+		s := strings.TrimSpace(line)
 		if s == "" {
-			return nil, nil
+			continue
 		}
-		lines := strings.Split(s, "\n")
-		var paths []string
-		for _, p := range lines {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			if _, err := os.Stat(p); err == nil {
-				paths = append(paths, p)
-			}
+		// Strip wrapping single or double quotes
+		if (strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"")) || (strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'")) {
+			s = s[1 : len(s)-1]
 		}
-		return paths, nil
-	case "windows":
-		// Prefer WinForms FileDropList for reliability
-		ps := strings.Join([]string{
-			"Add-Type -AssemblyName System.Windows.Forms",
-			"$fl = [System.Windows.Forms.Clipboard]::GetFileDropList()",
-			"if ($null -ne $fl) { $fl | ForEach-Object { $_ } }",
-		}, "; ")
-		cmd := exec.Command("powershell", "-STA", "-NoProfile", "-NonInteractive", "-Command", ps)
-		out, err := cmd.Output()
-		if err != nil {
-			return nil, nil
-		}
-		s := strings.TrimSpace(string(out))
-		if s == "" {
-			return nil, nil
-		}
-		lines := strings.Split(s, "\n")
-		var paths []string
-		for _, p := range lines {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			if _, err := os.Stat(p); err == nil {
-				paths = append(paths, p)
+		// Expand ~ on Unix-like
+		if runtime.GOOS != "windows" && strings.HasPrefix(s, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				s = filepath.Join(home, s[2:])
 			}
 		}
-		return paths, nil
-	default:
-		return nil, nil
+		// Accept file:// URIs (common in some Linux file managers)
+		if strings.HasPrefix(s, "file://") {
+			if u, err := neturl.Parse(s); err == nil {
+				if runtime.GOOS == "windows" {
+					if u.Host != "" { // UNC
+						s = `\\` + u.Host + filepath.FromSlash(u.Path)
+					} else {
+						p := u.Path
+						if len(p) >= 4 && p[0] == '/' && p[2] == ':' { // /C:/...
+							p = p[1:]
+						}
+						s = filepath.FromSlash(p)
+					}
+				} else {
+					s = filepath.FromSlash(u.Path)
+				}
+			}
+		}
+		// Basic path plausibility checks
+		looksAbsolute := false
+		if runtime.GOOS == "windows" {
+			if len(s) >= 3 && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
+				looksAbsolute = true // C:\ or C:/
+			}
+			if strings.HasPrefix(s, `\\\\`) { // UNC \\server\share
+				looksAbsolute = true
+			}
+		} else {
+			if strings.HasPrefix(s, "/") { // POSIX absolute
+				looksAbsolute = true
+			}
+		}
+		if !looksAbsolute {
+			// Skip non-absolute paths to reduce false positives
+			continue
+		}
+		if _, err := os.Stat(s); err == nil {
+			paths = append(paths, s)
+		}
 	}
-}
-
-// setClipboardFiles sets the OS clipboard to a list of file paths (macOS/Windows).
-func setClipboardFiles(paths []string) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		// Build AppleScript to set clipboard to a list of file aliases and also notify Finder.
-		parts := make([]string, 0, len(paths))
-		for _, p := range paths {
-			ep := strings.ReplaceAll(p, "\"", "\\\"")
-			parts = append(parts, `POSIX file "`+ep+`" as alias`)
-		}
-		obj := "{" + strings.Join(parts, ", ") + "}"
-		script := []string{
-			"-e", "set theFiles to " + obj,
-			"-e", "set the clipboard to theFiles",
-			"-e", "try",
-			"-e", "tell application \"Finder\" to set the clipboard to theFiles",
-			"-e", "end try",
-		}
-		cmd := exec.Command("osascript", script...)
-		return cmd.Run()
-	case "windows":
-		// Use WinForms Clipboard FileDropList via STA PowerShell
-		// This sets proper file references for Explorer paste.
-		esc := func(s string) string {
-			s = strings.ReplaceAll(s, "`", "``")
-			s = strings.ReplaceAll(s, "\"", "`\"")
-			return s
-		}
-		items := make([]string, 0, len(paths))
-		for _, p := range paths {
-			items = append(items, `"`+esc(p)+`"`)
-		}
-		ps := strings.Join([]string{
-			"Add-Type -AssemblyName System.Windows.Forms",
-			"$col = New-Object System.Collections.Specialized.StringCollection",
-			"$col.AddRange(@(" + strings.Join(items, ",") + "))",
-			"[System.Windows.Forms.Clipboard]::SetFileDropList($col)",
-		}, "; ")
-		cmd := exec.Command("powershell", "-STA", "-NoProfile", "-NonInteractive", "-Command", ps)
-		return cmd.Run()
-	default:
-		return errors.New("file clipboard not supported on this OS")
-	}
+	return paths
 }
 
 // suppressSet tracks content set by us to avoid echoing back
@@ -584,6 +527,62 @@ type fileSession struct {
 	dir  string
 }
 
+// appDir returns the directory containing the running executable.
+// Falls back to current working directory on error.
+func appDir() string {
+	exe, err := os.Executable()
+	if err == nil {
+		if d := filepath.Dir(exe); d != "" {
+			return d
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
+}
+
+func ensureInboxBase() (string, error) {
+	base := filepath.Join(appDir(), "inbox")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return "", err
+	}
+	return base, nil
+}
+
+func newSessionDir(id msgID) (string, error) {
+	base, err := ensureInboxBase()
+	if err != nil {
+		return "", err
+	}
+	// Timestamp + short id for uniqueness
+	short := hex.EncodeToString(id[:4])
+	name := time.Now().Format("20060102-150405") + "-" + short
+	dir := filepath.Join(base, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func openFolder(path string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "windows":
+		cmd = exec.Command("explorer", path)
+	default:
+		// Best-effort for Linux/others
+		if _, err := exec.LookPath("xdg-open"); err == nil {
+			cmd = exec.Command("xdg-open", path)
+		}
+	}
+	if cmd != nil {
+		_ = cmd.Start()
+	}
+}
+
 func (h *peerHub) handleFileFrame(pt []byte, soundPath string, suppress *suppressSet) error {
 	// Expect: CBF1\n<32hex>\nTYPE\n[bytes]
 	rest := pt[5:]
@@ -609,8 +608,8 @@ func (h *peerHub) handleFileFrame(pt []byte, soundPath string, suppress *suppres
 			// Already processed; ignore
 			return nil
 		}
-		// Create session and start extractor
-		dir, err := os.MkdirTemp("", "crossboard-*")
+		// Create per-transfer session dir under "inbox"
+		dir, err := newSessionDir(id)
 		if err != nil {
 			return err
 		}
@@ -654,28 +653,24 @@ func (h *peerHub) handleFileFrame(pt []byte, soundPath string, suppress *suppres
 		_ = sess.wr.Close()
 		<-sess.done
 		h.fileIDs.add(id)
-		// Collect top-level entries in dir to put on clipboard
+		// Collect top-level entries in dir for logging and opening
 		entries, _ := os.ReadDir(sess.dir)
 		var paths []string
 		for _, e := range entries {
 			paths = append(paths, filepath.Join(sess.dir, e.Name()))
 		}
-		if len(paths) > 0 {
-			// Set file clipboard; do NOT set text clipboard to avoid ping-pong
-			if err := setClipboardFiles(paths); err != nil {
-				log.Printf("set file clipboard failed: %v", err)
-			} else if soundPath != "" {
-				if _, err := os.Stat(soundPath); err == nil {
-					go func() {
-						if err := playWAV(soundPath); err != nil {
-							log.Printf("sound error: %v", err)
-						}
-					}()
-				}
+		if len(paths) > 0 && soundPath != "" {
+			if _, err := os.Stat(soundPath); err == nil {
+				go func() {
+					if err := playWAV(soundPath); err != nil {
+						log.Printf("sound error: %v", err)
+					}
+				}()
 			}
-			// Suppress re-broadcast by marking this selection
-			suppress.add(strings.Join(paths, "\n"))
 		}
+		log.Printf("received files extracted to inbox: %s (%d items)", sess.dir, len(paths))
+		// Open the folder for convenience
+		go openFolder(sess.dir)
 		return nil
 	default:
 		return fmt.Errorf("unknown file frame type: %s", typ)
@@ -771,16 +766,9 @@ func connector(ctx context.Context, addr string, aead cipher.AEAD, hub *peerHub,
 // clipboardWatcher polls clipboard and broadcasts changes to all peers.
 func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppress *suppressSet, enableFiles bool) {
 	lastSentHash := [32]byte{}
-	var lastFilesSig [32]byte
 	// Initialize baseline to current clipboard without sending on startup.
 	if txt, err := getClipboard(); err == nil && txt != "" {
 		lastSentHash = sha256.Sum256([]byte(txt))
-	}
-	if enableFiles {
-		if paths, _ := getClipboardFiles(); len(paths) > 0 {
-			sig := sha256.Sum256([]byte(strings.Join(paths, "\n")))
-			lastFilesSig = sig
-		}
 	}
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
@@ -789,28 +777,18 @@ func clipboardWatcher(ctx context.Context, aead cipher.AEAD, hub *peerHub, suppr
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// If file mode enabled, prefer files when clipboard contains file list
-            if enableFiles {
-                if paths, _ := getClipboardFiles(); len(paths) > 0 {
-                    joined := strings.Join(paths, "\n")
-                    // If we set this selection locally, suppress rebroadcast
-                    if suppress.contains(joined) {
-                        lastFilesSig = sha256.Sum256([]byte(joined))
-                        continue
-                    }
-                    sig := sha256.Sum256([]byte(joined))
-                    if sig != lastFilesSig {
-                        lastFilesSig = sig
-                        go sendFilesAsStream(ctx, aead, hub, paths)
-                    }
-                    // When files detected, skip text processing this tick
-                    continue
-                }
-            }
-			// Fallback to text
 			txt, err := getClipboard()
 			if err != nil || txt == "" {
 				continue
+			}
+			// If -f is on and the text looks like absolute paths that exist, send files instead of text.
+			if enableFiles {
+				if paths := parsePathsFromText(txt); len(paths) > 0 {
+					// Suppress re-sending this same clipboard content
+					lastSentHash = sha256.Sum256([]byte(txt))
+					go sendFilesAsStream(ctx, aead, hub, paths)
+					continue
+				}
 			}
 			if suppress.contains(txt) {
 				lastSentHash = sha256.Sum256([]byte(txt))
