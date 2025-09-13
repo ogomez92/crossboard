@@ -20,10 +20,12 @@ Secure, minimal, cross‑platform clipboard sync over a single TCP connection. T
 - `-addr host:port`: Listen address (default `:9876`).
 - `-sound path`: WAV to play on copy (default `copy.wav`).
 - `-f`: Enable file transfer. When the clipboard text looks like absolute paths (including `file://` URIs), Crossboard tars and streams those paths instead of sending the text.
+- `-x path`: Custom file explorer command to open received inbox folders (e.g., `-x C:\\Tools\\Explorer++.exe` on Windows). If it fails, Crossboard falls back to the system default opener.
 
 Behavior
 - Text: On change, sends text; receiver writes to clipboard and plays sound.
 - Files with `-f`: Sender detects path‑like text and streams referenced files; receiver extracts into `<app_dir>/inbox/<timestamp>-<id>`, opens that folder in Finder/Explorer (or `xdg-open`), and plays sound. The receiver clipboard is not modified to avoid loops.
+  - Use `-x` to override the opener (helpful for Total Commander, Explorer++, etc.).
 
 ## Build
 

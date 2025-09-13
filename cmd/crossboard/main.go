@@ -280,6 +280,14 @@ func parsePathsFromText(txt string) []string {
 			paths = append(paths, s)
 		}
 	}
+	if len(paths) == 0 {
+		fields := strings.Fields(txt)
+		if len(fields) >= 2 {
+			if out := filterExistingPaths(fields); len(out) == len(fields) {
+				return out
+			}
+		}
+	}
 	return paths
 }
 
@@ -475,10 +483,11 @@ type peerHub struct {
 	ids       *idCache
 	fileIDs   *idCache
 	fsessions map[msgID]*fileSession
+	opener    string
 }
 
-func newPeerHub() *peerHub {
-	return &peerHub{conns: make(map[*peerConn]struct{}), ids: newIDCache(), fileIDs: newIDCache(), fsessions: make(map[msgID]*fileSession)}
+func newPeerHub(opener string) *peerHub {
+	return &peerHub{conns: make(map[*peerConn]struct{}), ids: newIDCache(), fileIDs: newIDCache(), fsessions: make(map[msgID]*fileSession), opener: opener}
 }
 
 func (h *peerHub) add(c net.Conn) *peerConn {
@@ -675,7 +684,16 @@ func newSessionDir(id msgID) (string, error) {
 	return dir, nil
 }
 
-func openFolder(path string) {
+func openFolder(opener, path string) {
+	// Custom opener if provided
+	if opener != "" {
+		cmd := exec.Command(opener, path)
+		if e := cmd.Start(); e == nil {
+			return
+		} else {
+			log.Printf("custom opener failed, falling back: %v", e)
+		}
+	}
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
@@ -787,7 +805,7 @@ func (h *peerHub) handleFileFrame(pt []byte, soundPath string, suppress *suppres
 		}
 		log.Printf("received files extracted to inbox: %s (%d items)", sess.dir, len(paths))
 		// Open the folder for convenience
-		go openFolder(sess.dir)
+		go openFolder(h.opener, sess.dir)
 		return nil
 	default:
 		return fmt.Errorf("unknown file frame type: %s", typ)
@@ -963,6 +981,7 @@ func main() {
 		listenAddr  string
 		soundPath   string
 		fileMode    bool
+		openerPath  string
 	)
 
 	flag.StringVar(&monitorHost, "m", "", "monitor clipboard and send to host (hostname or host:port)")
@@ -970,6 +989,7 @@ func main() {
 	flag.StringVar(&listenAddr, "addr", defaultListenAddr, "listen address for incoming connections")
 	flag.StringVar(&soundPath, "sound", "copy.wav", "path to WAV sound file to play on copy")
 	flag.BoolVar(&fileMode, "f", false, "enable file transfer in monitor mode (-m)")
+	flag.StringVar(&openerPath, "x", "", "custom file explorer command to open received inbox folders")
 	flag.Parse()
 	args := flag.Args()
 
@@ -1035,7 +1055,7 @@ func main() {
 	defer cancel()
 
 	suppress := newSuppressSet()
-	hub := newPeerHub()
+	hub := newPeerHub(openerPath)
 
 	// Always run server to accept peers
 	srvErrCh := make(chan error, 1)
