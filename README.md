@@ -125,6 +125,7 @@ Notes:
 - Text is always treated as text; images and rich formats are not synchronized.
 - File transfer via `-f` is supported on macOS and Windows (Finder/Explorer file clipboards). On Linux, `-f` is ignored.
 - To avoid loops, received files are put on the destination file clipboard only (not mirrored back as text).
+  - Paste files into Finder (macOS) or Explorer (Windows) — not into text fields. The clipboard holds file references for paste actions in file managers.
 
 ## Security
 
